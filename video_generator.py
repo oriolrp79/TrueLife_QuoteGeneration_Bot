@@ -4,13 +4,18 @@ import requests
 from io import BytesIO
 from PIL import Image, ImageDraw, ImageFont
 import numpy as np
-from moviepy.editor import VideoClip, ImageClip, CompositeVideoClip
+
+# Pedaç de compatibilitat perquè MoviePy no falli amb versions modernes de Pillow
+if not hasattr(Image, 'ANTIALIAS'):
+    Image.ANTIALIAS = Image.Resampling.LANCZOS
+
+from moviepy.editor import VideoClip, CompositeVideoClip
 
 # Claus configurades
 UNSPLASH_ACCESS_KEY = "FXyqZB5bzwoFjCRUH041E11tPGU_jXundEp8mCyn87s"
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 
-# 1. GENERAR QUOTE AMB GEMINI PRO
+# 1. GENERAR QUOTE AMB GEMINI
 def get_quote():
     if GEMINI_API_KEY:
         try:
@@ -23,6 +28,8 @@ def get_quote():
                 "STRICT CONSTRAINT: Total length MUST NOT EXCEED 40 characters in total. "
                 "Do not use quotation marks, author names or emojis. Only the sentence."
             )
+            
+            # Utilitzem el model actiu segons l'especificació del servei
             response = client.models.generate_content(
                 model="gemini-2.5-flash",
                 contents=prompt
@@ -31,7 +38,19 @@ def get_quote():
             if 5 < len(q) <= 40:
                 return q
         except Exception as e:
-            print(f"[Avís Gemini] {e}. Fent servir frase de seguretat.")
+            # Si falla, provem automàticament amb gemini-1.5-flash
+            try:
+                from google import genai
+                client = genai.Client(api_key=GEMINI_API_KEY)
+                response = client.models.generate_content(
+                    model="gemini-1.5-flash",
+                    contents="Write a short motivational quote under 40 characters in English."
+                )
+                q = response.text.strip().replace('"', '').replace("'", "")
+                if 5 < len(q) <= 40:
+                    return q
+            except Exception as inner_e:
+                print(f"[Avís Gemini] Error: {inner_e}. Fent servir frase de seguretat.")
 
     fallbacks = [
         "Small steps lead to massive gains.",
@@ -52,14 +71,15 @@ def get_background_image(query="nature,mountains,minimal"):
         if "urls" in res and "regular" in res["urls"]:
             img_data = requests.get(res["urls"]["regular"], timeout=10).content
             img = Image.open(BytesIO(img_data)).convert("RGB")
-            return img.resize((1080, 1920), Image.Resampling.LANCZOS)
+            # Descarreguem a una mida lleugerament més gran per poder fer el zoom netament
+            return img.resize((1200, 2133), Image.Resampling.LANCZOS)
     except Exception as e:
         print(f"[Avís Unsplash] {e}")
 
-    return Image.new("RGB", (1080, 1920), color=(18, 24, 38))
+    return Image.new("RGB", (1200, 2133), color=(18, 24, 38))
 
 # 3. CREACIÓ DEL VÍDEO
-def create_short_video(output_filename="output_short.mp4"):
+def create_short_video(output_filename="sample_short.mp4"):
     quote = get_quote()
     if len(quote) > 40:
         quote = quote[:37] + "..."
@@ -67,20 +87,30 @@ def create_short_video(output_filename="output_short.mp4"):
 
     print(" Descarregant fons d'Unsplash...")
     bg_pil = get_background_image()
-    bg_np = np.array(bg_pil)
+    w_orig, h_orig = bg_pil.size
 
     duration = 8  # 8 segons
 
-    # Zoom suau (Ken Burns)
-    clip_bg = ImageClip(bg_np).set_duration(duration)
-    clip_bg_animated = clip_bg.resize(lambda t: 1.0 + 0.012 * t).set_position(('center', 'center'))
+    # Animació del fons amb Pillow (elimina el problema de MoviePy amb ANTIALIAS)
+    def make_background_frame(t):
+        # Factor de zoom lent d'1.0 a 1.08
+        zoom = 1.0 + (0.01 * t)
+        crop_w = int(1080 / zoom)
+        crop_h = int(1920 / zoom)
+        
+        left = (w_orig - crop_w) // 2
+        top = (h_orig - crop_h) // 2
+        
+        cropped = bg_pil.crop((left, top, left + crop_w, top + crop_h))
+        frame_img = cropped.resize((1080, 1920), Image.Resampling.BILINEAR)
+        
+        # Filtre fosc (65% brillantor)
+        frame_np = (np.array(frame_img) * 0.65).astype(np.uint8)
+        return frame_np
 
-    # Filtre fosc per contrast
-    def add_dark_filter(frame):
-        return (frame * 0.65).astype(np.uint8)
-    clip_bg_dark = clip_bg_animated.fl_image(add_dark_filter)
+    bg_clip = VideoClip(make_background_frame, ismask=False).set_duration(duration)
 
-    # Animació de text (Typewriter)
+    # Animació de text (Typewriter progressiu durant els primers 4.5 segons)
     def make_typewriter_frame(t):
         chars_to_show = int(len(quote) * min(1.0, t / 4.5))
         current_text = quote[:chars_to_show]
@@ -98,7 +128,7 @@ def create_short_video(output_filename="output_short.mp4"):
         x = (1080 - w) / 2
         y = 820
 
-        # Vora negra i text blanc
+        # Vora negra i text blanc per màxim contrast
         for dx, dy in [(-3, -3), (3, -3), (-3, 3), (3, 3), (0, 4)]:
             draw.text((x + dx, y + dy), current_text, font=font, fill=(0, 0, 0, 230))
         draw.text((x, y), current_text, font=font, fill=(255, 255, 255, 255))
@@ -106,8 +136,8 @@ def create_short_video(output_filename="output_short.mp4"):
 
     text_anim_clip = VideoClip(make_typewriter_frame, ismask=False).set_duration(duration)
 
-    # Peu de pàgina fix amb branding
-    def make_footer_frame():
+    # Peu de pàgina amb la marca de TrueLife
+    def make_footer_frame(t):
         img = Image.new('RGBA', (1080, 1920), (0, 0, 0, 0))
         draw = ImageDraw.Draw(img)
 
@@ -126,16 +156,16 @@ def create_short_video(output_filename="output_short.mp4"):
         t2 = "TrueLife on Google Play"
         w2 = draw.textbbox((0, 0), t2, font=font_s)[2] - draw.textbbox((0, 0), t2, font=font_s)[0]
         x2 = (1080 - w2) / 2
-        draw.text((x2 + 1, 1656), t2, font=font_s, fill=(0, 0, 0, 180))
+        draw.text((x2 + 1, 1656), t2, font=font_sub, fill=(0, 0, 0, 180))
         draw.text((x2, 1655), t2, font=font_s, fill=(120, 200, 255, 240))
         return np.array(img)
 
-    footer_clip = ImageClip(make_footer_frame()).set_duration(duration)
+    footer_clip = VideoClip(make_footer_frame, ismask=False).set_duration(duration)
 
-    # Muntatge i exportació
-    print(" Compilant vídeo MP4 H.264...")
+    # Renderitzat final
+    print(" Compilant vídeo MP4 H.264 (8s, 1080x1920)...")
     final_clip = CompositeVideoClip(
-        [clip_bg_dark, text_anim_clip, footer_clip],
+        [bg_clip, text_anim_clip, footer_clip],
         size=(1080, 1920)
     ).set_duration(duration)
 
@@ -146,7 +176,7 @@ def create_short_video(output_filename="output_short.mp4"):
         audio=False,
         preset="ultrafast"
     )
-    print(f" Vídeo creat a: {output_filename}")
+    print(f" Vídeo generat a: {output_filename}")
     return output_filename
 
 if __name__ == "__main__":
