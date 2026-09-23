@@ -1,8 +1,5 @@
-moviepy
+google-genai
+moviepy==1.0.3
 Pillow
 requests
-openai
-tweepy
-google-api-python-client
-google-auth-oauthlib
-google-auth-httplib2
+numpy
